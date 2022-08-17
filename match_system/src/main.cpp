@@ -72,10 +72,23 @@ class Pool
         {
             while (users.size() > 1)
             {
-                auto a = users[0], b = users[1];
-                users.erase(users.begin());
-                users.erase(users.begin());
-                save_result(a.id, b.id);
+                sort(users.begin(), users.end(), [&](User& a, User b){
+                    return a.score < b.score;
+                        });
+
+                bool flag = true;
+                for (uint32_t i = 1; i < users.size(); i++)
+                {
+                    auto a = users[i - 1], b = users[i];
+                    if (b.score - a.score <= 50)
+                    {
+                        users.erase(users.begin() + i - 1, users.begin() + i + 1);
+                        save_result(a.id, b.id);
+
+                        break;
+                    }
+                }
+                if (flag) break;
             }
         }
 
@@ -150,7 +163,12 @@ void consume_task()
             // 可以考虑当发现队列为空，就把这个进程阻塞住，把它卡住，直到有新的玩家加入
             // 用条件变量，先将这个锁解开，然后就把这个线程卡在这里
             // 直到其他线程将这个条件变量唤醒为止
-            message_queue.cv.wait(lck);
+            // message_queue.cv.wait(lck);
+
+            // 当队列是空的，则解锁，放弃消费线程对锁的把控，紧接着睡眠1秒钟，而后进行匹配（note：在这睡眠的1秒钟内其他线程可以对消息队列进行操作，可能会匹配成功）
+            lck.unlock();
+            sleep(1);
+            pool.match();
         }
         else
         {
