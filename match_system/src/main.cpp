@@ -9,6 +9,12 @@
 
 #include <iostream>
 
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <vector>
+
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
@@ -17,6 +23,61 @@ using namespace ::apache::thrift::server;
 using namespace  ::match_service;
 
 using namespace std;
+
+struct Task
+{
+    User user;
+    string type;
+};
+
+struct MessageQueue
+{
+    queue<Task> q;
+    mutex m;
+    condition_variable cv;
+}message_queue;
+
+
+class Pool
+{
+    public:
+        void save_result(int a, int b)
+        {
+            printf("匹配结果为 %d %d\n", a, b);
+        }
+
+        void match()
+        {
+            while (users.size() > 1)
+            {
+                auto a = users[0], b = users[1];
+                users.erase(users.begin());
+                users.erase(users.begin());
+                save_result(a.id, b.id);
+            }
+        }
+
+        void add(User user)
+        {
+            users.push_back(user);
+        }
+
+        void remove(User user)
+        {
+            for (uint32_t i = 0; i < users.size(); i++)
+                if (users[i].id == user.id)
+                {
+                    users.erase(users.begin() + i);
+                    break;
+                }
+        }
+
+    // 存储所有的玩家
+    private:
+        vector<User> users;
+}pool;
+
+
 
 class MatchHandler : virtual public MatchIf {
     public:
@@ -28,6 +89,14 @@ class MatchHandler : virtual public MatchIf {
             // Your implementation goes here
             printf("add_user\n");
 
+            // 加锁 不需要显式将其解锁 当这个局部执行完后即该局部变量就会消失，会自动解锁掉
+            unique_lock<mutex> lck(message_queue.m);
+
+            message_queue.q.push({user, "add"});
+
+            // 唤醒条件变量 通知所有被条件变量卡住的线程，会有一个随机的线程执行
+            message_queue.cv.notify_all();
+
             return 0;
         }
 
@@ -35,10 +104,50 @@ class MatchHandler : virtual public MatchIf {
             // Your implementation goes here
             printf("remove_user\n");
 
+            // 加锁
+            unique_lock<mutex> lck(message_queue.m);
+
+            message_queue.q.push({user, "remove"});
+
+            // 唤醒条件变量
+            message_queue.cv.notify_all();
+
             return 0;
         }
 
 };
+
+void consume_task()
+{
+    while (true)
+    {
+        unique_lock<mutex> lck(message_queue.m);
+        if (message_queue.q.empty())
+        {
+            // 当一个游戏刚开始时队列一般都是空的，若continue的话，则consume_task会陷入死循环，不停地占用锁，CPU占有率很大
+            // 可以考虑当发现队列为空，就把这个进程阻塞住，把它卡住，直到有新的玩家加入
+            // 用条件变量，先将这个锁解开，然后就把这个线程卡在这里
+            // 直到其他线程将这个条件变量唤醒为止
+            message_queue.cv.wait(lck);
+        }
+        else
+        {
+            auto task = message_queue.q.front();
+            message_queue.q.pop();
+            // 解锁 保证都后面do task时也可以支持添加/删除用户的操作
+            // 处理完共享的变量后要及时解锁
+            lck.unlock();
+
+            // do task
+            // 将所有的用户放到匹配池进行匹配
+            if (task.type == "add") pool.add(task.user);
+            else if (task.type == "remove") pool.remove(task.user);
+
+            pool.match();
+        }
+    }
+}
+
 
 int main(int argc, char **argv) {
     int port = 9090;
@@ -51,6 +160,8 @@ int main(int argc, char **argv) {
     TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
 
     cout << "开始匹配服务" << endl;
+
+    thread matching_thread(consume_task);
 
     server.serve();
     return 0;
